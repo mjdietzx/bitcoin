@@ -20,7 +20,7 @@ bool VerifyWallets(interfaces::Chain& chain)
 {
     if (gArgs.IsArgSet("-walletdir")) {
         fs::path wallet_dir = gArgs.GetArg("-walletdir", "");
-        boost::system::error_code error;
+        std::error_code error;
         // The canonical path cleans the path, preventing >1 Berkeley environment instances for the same directory
         fs::path canonical_wallet_dir = fs::canonical(wallet_dir, error);
         if (error || !fs::exists(wallet_dir)) {
@@ -62,7 +62,7 @@ bool VerifyWallets(interfaces::Chain& chain)
     std::set<fs::path> wallet_paths;
 
     for (const auto& wallet_file : gArgs.GetArgs("-wallet")) {
-        const fs::path path = fs::absolute(wallet_file, GetWalletDir());
+        const fs::path path = fs::absolute(GetWalletDir() / wallet_file);
 
         if (!wallet_paths.insert(path).second) {
             chain.initWarning(strprintf(_("Ignoring duplicate -wallet %s."), wallet_file));
