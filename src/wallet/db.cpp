@@ -12,7 +12,6 @@
 
 std::vector<fs::path> ListDatabases(const fs::path& wallet_dir)
 {
-    const size_t offset = wallet_dir.string().size() + 1;
     std::vector<fs::path> paths;
     std::error_code ec;
 
@@ -23,8 +22,8 @@ std::vector<fs::path> ListDatabases(const fs::path& wallet_dir)
         }
 
         try {
-            // Get wallet path relative to walletdir by removing walletdir from the wallet path.
-            const fs::path path = it->path().string().substr(offset);
+            // Get wallet path relative to wallet_dir by removing wallet_dir from the wallet path.
+            const fs::path path = it->path().lexically_relative(wallet_dir);
 
             if (it->status().type() == fs::file_type::directory &&
                 (IsBDBFile(BDBDataFile(it->path())) || IsSQLiteFile(SQLiteDataFile(it->path())))) {
