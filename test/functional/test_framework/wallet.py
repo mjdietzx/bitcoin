@@ -4,7 +4,9 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """A limited-functionality wallet, which may replace a real wallet in tests"""
 
+from collections import defaultdict
 from decimal import Decimal
+from itertools import chain
 from test_framework.address import ADDRESS_BCRT1_P2WSH_OP_TRUE
 from test_framework.messages import (
     COIN,
@@ -29,7 +31,8 @@ from test_framework.util import (
 class MiniWallet:
     def __init__(self, test_node, *, raw_script=False):
         self._test_node = test_node
-        self._utxos = []
+        self._utxos = defaultdict(list)
+        self._mempool = 1e9
         if raw_script:
             self._address = None
             self._scriptPubKey = bytes(CScript([OP_TRUE]))
@@ -42,26 +45,31 @@ class MiniWallet:
         for i in range(start, start + num):
             block = self._test_node.getblock(blockhash=self._test_node.getblockhash(i), verbosity=2)
             for tx in block['tx']:
-                self.scan_tx(tx)
+                self.scan_tx(tx, block['height'])
 
-    def scan_tx(self, tx):
+    def scan_tx(self, tx, block_height):
         """Scan the tx for self._scriptPubKey outputs and add them to self._utxos"""
         for out in tx['vout']:
             if out['scriptPubKey']['hex'] == self._scriptPubKey.hex():
-                self._utxos.append({'txid': tx['txid'], 'vout': out['n'], 'value': out['value']})
+                utxo = {'txid': tx['txid'], 'vout': out['n'], 'value': out['value']}
+                if utxo in self._utxos[self._mempool]:  # move from mempool to block
+                    self._utxos[self._mempool].remove(utxo)
+                if utxo not in self._utxos[block_height]:  # prevent duplicate entries
+                    self._utxos[block_height].append(utxo)
 
     def generate(self, num_blocks):
         """Generate blocks with coinbase outputs to the internal address, and append the outputs to the internal list"""
         blocks = self._test_node.generatetodescriptor(num_blocks, f'raw({self._scriptPubKey.hex()})')
         for b in blocks:
             cb_tx = self._test_node.getblock(blockhash=b, verbosity=2)['tx'][0]
-            self._utxos.append({'txid': cb_tx['txid'], 'vout': 0, 'value': cb_tx['vout'][0]['value']})
+            height = self._test_node.getblockheader(b)['height']
+            self._utxos[height].append({'txid': cb_tx['txid'], 'vout': 0, 'value': cb_tx['vout'][0]['value']})
         return blocks
 
     def get_address(self):
         return self._address
 
-    def get_utxo(self, *, txid='', mark_as_spent=True):
+    def get_utxo(self, *, txid='', mark_as_spent=True, block_height=None):
         """
         Returns a utxo and marks it as spent (pops it from the internal list)
 
@@ -71,13 +79,17 @@ class MiniWallet:
         Note: Can be used to get the change output immediately after a send_self_transfer
         """
         index = -1  # by default the last utxo
+        k = block_height if block_height != None else max(self._utxos.keys())
         if txid:
-            utxo = next(filter(lambda utxo: txid == utxo['txid'], self._utxos))
-            index = self._utxos.index(utxo)
+            for k in self._utxos:
+                for utxo in filter(lambda _utxo: txid == _utxo['txid'], self._utxos[k]):
+                    index = self._utxos[k].index(utxo)
+                if (index >= 0):
+                    break
         if mark_as_spent:
-            return self._utxos.pop(index)
+            return self._utxos[k].pop(index)
         else:
-            return self._utxos[index]
+            return self._utxos[k][index]
 
     def send_self_transfer(self, *, fee_rate=Decimal("0.003"), from_node, utxo_to_spend=None):
         """Create and send a tx with the specified fee_rate. Fee may be exact or at most one satoshi higher than needed."""
@@ -87,8 +99,10 @@ class MiniWallet:
 
     def create_self_transfer(self, *, fee_rate=Decimal("0.003"), from_node, utxo_to_spend=None, mempool_valid=True):
         """Create and return a tx with the specified fee_rate. Fee may be exact or at most one satoshi higher than needed."""
-        self._utxos = sorted(self._utxos, key=lambda k: k['value'])
-        utxo_to_spend = utxo_to_spend or self._utxos.pop()  # Pick the largest utxo (if none provided) and hope it covers the fee
+        if not utxo_to_spend:  # Pick the largest utxo (if none provided) and hope it covers the fee
+            largest_utxo = max(chain.from_iterable(self._utxos.values()), key=lambda k: k['value'])
+            utxo_to_spend = self.get_utxo(txid=largest_utxo['txid'])
+
         vsize = Decimal(96)
         send_value = satoshi_round(utxo_to_spend['value'] - fee_rate * (vsize / 1000))
         fee = utxo_to_spend['value'] - send_value
@@ -114,4 +128,4 @@ class MiniWallet:
 
     def sendrawtransaction(self, *, from_node, tx_hex):
         from_node.sendrawtransaction(tx_hex)
-        self.scan_tx(from_node.decoderawtransaction(tx_hex))
+        self.scan_tx(from_node.decoderawtransaction(tx_hex), self._mempool)

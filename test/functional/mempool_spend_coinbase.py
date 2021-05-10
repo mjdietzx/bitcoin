@@ -32,10 +32,9 @@ class MempoolSpendCoinbaseTest(BitcoinTestFramework):
         # Coinbase at height chain_height-100+1 ok in mempool, should
         # get mined. Coinbase at height chain_height-100+2 is
         # too immature to spend.
-        wallet.scan_blocks(start=chain_height - 100 + 1, num=1)
-        utxo_mature = wallet.get_utxo()
-        wallet.scan_blocks(start=chain_height - 100 + 2, num=1)
-        utxo_immature = wallet.get_utxo()
+        wallet.scan_blocks(start=chain_height - 100 + 1, num=2)
+        utxo_mature = wallet.get_utxo(block_height=chain_height-100+1)
+        utxo_immature = wallet.get_utxo(block_height=chain_height-100+2)
 
         spend_mature_id = wallet.send_self_transfer(from_node=self.nodes[0], utxo_to_spend=utxo_mature)["txid"]
 
