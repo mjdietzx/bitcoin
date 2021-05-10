@@ -141,11 +141,6 @@ std::string EncodeHexTx(const CTransaction& tx, const int serializeFlags)
     return HexStr(ssTx);
 }
 
-void ScriptToUniv(const CScript& script, UniValue& out)
-{
-    ScriptPubKeyToUniv(script, out, /* include_hex */ true, /* include_address */ false);
-}
-
 void ScriptPubKeyToUniv(const CScript& scriptPubKey, UniValue& out, bool include_hex, bool include_address)
 {
     CTxDestination address;
