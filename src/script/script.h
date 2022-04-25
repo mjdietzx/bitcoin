@@ -59,6 +59,10 @@ static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 // How much weight budget is added to the witness size (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
 
+// Precompute/cache transaction data for all transactions w/ total size (in bytes) greater than this
+// threshold. Added for BIP119 CTV to prevent DoS risk.
+static const int MAX_TXN_SIZE_PRECOMPUTE_CTV_DATA = 2048;
+
 template <typename T>
 std::vector<unsigned char> ToByteVector(const T& in)
 {

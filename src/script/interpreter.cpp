@@ -1521,11 +1521,22 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_spent_outputs_ready = true;
     }
 
-    // TODO: Improve this heuristic
-    bool uses_bip119_ctv = true;
     // Determine which precomputation-impacting features this transaction uses.
     bool uses_bip143_segwit = force;
     bool uses_bip341_taproot = force;
+
+    // The reason we must cache data (specifically scriptSigs and outputs hashes) is to prevent scripts like "CTV CTV CTV.... CTV" from being able to cause N^2 hashing to occur.
+    // The issue is, without caching, a script like this causes `N` hashes of `T` data, where T is the size of the transaction.
+    // Therefore without caching, in the worst-case we will hash over `N*T` data to evaluate a script like this. Expected runtime predominantly increases with total number of bytes hashed
+    // `N` (number of CTVs in the script) is already pretty tightly bounded by consensus, where `N` <= `MAX_OPS_PER_SCRIPT`
+    // Therefore, we bound `T` here s.t. we will always cache the necessary data for CTV for all tansactions over a certain size.
+    // It's fine if we cache some of these hashes for transactions that aren't CTV - it's just a single extra hash
+    // Now we have a good idea of what the worst possible runtime is for a CTV transaction crafted specifically as a DoS attack:
+    // hashing less than MAX_OPS_PER_SCRIPT*MAX_TXN_SIZE_PRECOMPUTE_CTV_DATA bytes of data
+    // Caching is required for "safety", not performance - if CTV gains traction an optimal caching policy for performance can be determined and improved at that point
+    // For now we just want to be secure.
+    const bool precompute_bip119_ctv_data = force || ::GetSerializeSize(txTo, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS) > MAX_TXN_SIZE_PRECOMPUTE_CTV_DATA;
+
     for (size_t inpos = 0; inpos < txTo.vin.size() && !(uses_bip143_segwit && uses_bip341_taproot); ++inpos) {
         if (!txTo.vin[inpos].scriptWitness.IsNull()) {
             if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
@@ -1545,16 +1556,11 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         if (uses_bip341_taproot && uses_bip143_segwit) break; // No need to scan further if we already need all.
     }
 
-    if (uses_bip143_segwit || uses_bip341_taproot || uses_bip119_ctv) {
+    if (uses_bip143_segwit || uses_bip341_taproot || precompute_bip119_ctv_data) {
         // Computations shared between both sighash schemes.
         m_prevouts_single_hash = GetPrevoutsSHA256(txTo);
         m_sequences_single_hash = GetSequencesSHA256(txTo);
         m_outputs_single_hash = GetOutputsSHA256(txTo);
-
-        // 0 hash used to signal if we should skip scriptSigs
-        // when re-computing for different indexes.
-        m_scriptSigs_single_hash = NoScriptSigs(txTo) ? uint256{} : GetScriptSigsSHA256(txTo);
-        m_bip119_ctv_ready = true;
     }
     if (uses_bip143_segwit) {
         hashPrevouts = SHA256Uint256(m_prevouts_single_hash);
@@ -1566,6 +1572,12 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_spent_amounts_single_hash = GetSpentAmountsSHA256(m_spent_outputs);
         m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);
         m_bip341_taproot_ready = true;
+    }
+    if (precompute_bip119_ctv_data) {
+        // 0 hash used to signal if we should skip scriptSigs
+        // when re-computing for different indexes.
+        m_scriptSigs_single_hash = NoScriptSigs(txTo) ? uint256{} : GetScriptSigsSHA256(txTo);
+        m_bip119_ctv_ready = true;
     }
 }
 
@@ -1909,12 +1921,12 @@ bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(
 {
     // Should already be checked before calling...
     assert(hash.size() == 32);
-    if (txdata && txdata->m_bip119_ctv_ready) {
-        assert(txTo != nullptr);
-        uint256 hash_tmpl = txdata->m_scriptSigs_single_hash.IsNull() ?
-            GetDefaultCheckTemplateVerifyHashEmptyScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash, nIn) :
-            GetDefaultCheckTemplateVerifyHashWithScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash,
-                    txdata->m_scriptSigs_single_hash, nIn);
+    if (txdata && txTo) {
+        const bool cached = txdata->m_bip143_segwit_ready || txdata->m_bip341_taproot_ready || txdata->m_bip119_ctv_ready; // if we have any shared computations, we might as well use them
+        const uint256 hash_tmpl = NoScriptSigs(*txTo) ?
+            GetDefaultCheckTemplateVerifyHashEmptyScript(*txTo, cached ? txdata->m_outputs_single_hash : GetOutputsSHA256(*txTo), cached ? txdata->m_sequences_single_hash : GetSequencesSHA256(*txTo), nIn) :
+            GetDefaultCheckTemplateVerifyHashWithScript(*txTo, cached ? txdata->m_outputs_single_hash : GetOutputsSHA256(*txTo), cached ? txdata->m_sequences_single_hash : GetSequencesSHA256(*txTo),
+                    txdata->m_bip119_ctv_ready ? txdata->m_scriptSigs_single_hash : GetScriptSigsSHA256(*txTo), nIn);
         return std::equal(hash_tmpl.begin(), hash_tmpl.end(), hash.data());
     } else {
         return HandleMissingData(m_mdb);
