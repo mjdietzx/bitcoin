@@ -3751,11 +3751,13 @@ void CWallet::DeactivateScriptPubKeyMan(uint256 id, OutputType type, bool intern
 
 DescriptorScriptPubKeyMan* CWallet::GetDescriptorScriptPubKeyMan(const WalletDescriptor& desc) const
 {
-    auto spk_man_pair = m_spk_managers.find(desc.id);
-
-    if (spk_man_pair != m_spk_managers.end()) {
-        // Try to downcast to DescriptorScriptPubKeyMan then check if the descriptors match
-        DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man_pair->second.get());
+    // Match on descriptor content rather than the map key. The managers are keyed by DescriptorID,
+    // but an older software version may have stored this descriptor's manager under an id derived
+    // from a different string canonicalization. Scanning and comparing the descriptor itself lets a
+    // re-import update the existing ScriptPubKeyMan instead of creating a duplicate. This is only
+    // reached on import/setup and the number of managers is small, so the linear scan is cheap.
+    for (const auto& spk_man_pair : m_spk_managers) {
+        DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man_pair.second.get());
         if (spk_manager != nullptr && spk_manager->HasWalletDescriptor(desc)) {
             return spk_manager;
         }

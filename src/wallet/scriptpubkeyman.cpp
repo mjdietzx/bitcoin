@@ -1502,7 +1502,11 @@ void DescriptorScriptPubKeyMan::Load()
 bool DescriptorScriptPubKeyMan::HasWalletDescriptor(const WalletDescriptor& desc) const
 {
     LOCK(cs_desc_man);
-    return !m_wallet_descriptor.id.IsNull() && !desc.id.IsNull() && m_wallet_descriptor.id == desc.id;
+    // Two WalletDescriptors refer to the same descriptor when their canonical ids match. Comparing
+    // the recomputed DescriptorID rather than the stored ids recognizes a descriptor whose id was
+    // written by an older software version that canonicalized the descriptor string differently.
+    return m_wallet_descriptor.descriptor != nullptr && desc.descriptor != nullptr &&
+           DescriptorID(*m_wallet_descriptor.descriptor) == DescriptorID(*desc.descriptor);
 }
 
 void DescriptorScriptPubKeyMan::WriteDescriptor()
@@ -1595,10 +1599,15 @@ util::Result<void> DescriptorScriptPubKeyMan::UpdateWalletDescriptor(WalletDescr
         return util::Error{Untranslated(std::move(error))};
     }
 
+    // Preserve the id under which this manager is stored (in m_spk_managers and on disk). An older
+    // software version may have computed a different id for the same descriptor; keeping it avoids
+    // orphaning the existing records or splitting them across two ids.
+    const uint256 existing_id{m_wallet_descriptor.id};
     m_map_pubkeys.clear();
     m_map_script_pub_keys.clear();
     m_max_cached_index = -1;
     m_wallet_descriptor = descriptor;
+    m_wallet_descriptor.id = existing_id;
 
     WalletBatch batch(m_storage.GetDatabase());
     UpdateWithSigningProvider(batch, provider);
