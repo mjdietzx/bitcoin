@@ -4,14 +4,15 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test a Taproot multisig that starts as 4-of-4 and "decays" to 3-of-4, 2-of-4, and finally 1-of-4 at each future halvening block height.
 
-Spending policy: `tr(musig(key_1,key_2,key_3,key_4),thresh(4,pk(key_1),pk(key_2),pk(key_3),pk(key_4),after(t1),after(t2),after(t3)))`
+Spending policy: `tr(musig(key_1,key_2,key_3,key_4),{and_v(v:after(t1),multi_a(3,key_1,key_2,key_3,key_4)),{and_v(v:after(t2),multi_a(2,key_1,key_2,key_3,key_4)),and_v(v:after(t3),multi_a(1,key_1,key_2,key_3,key_4))}})`
 
-This is the Taproot analogue of `test/functional/wallet_miniscript_decaying_multisig_descriptor_psbt.py`.
+This is a Taproot variant of `test/functional/wallet_miniscript_decaying_multisig_descriptor_psbt.py`.
 The 4-of-4 "everyone signs" case is spent through the Taproot key path using a MuSig2 aggregate key
-(for the best privacy and lowest fees), while the "decayed" thresholds are spent through a Miniscript
-script path. As with the wsh version the signers are plain single-key wallets: everything they need
-to sign, including the MuSig2 participant pubkeys, is carried in the PSBT, so they never import the
-multisig descriptor.
+(the cheapest, most private spend). The "decayed" thresholds are spent through the script path, with
+one `multi_a` leaf per level behind a halvening locktime. Using separate `multi_a` leaves (rather than
+a single `thresh`) keeps `OP_IF` out of the tapscripts. As with the wsh version the signers are plain
+single-key wallets: everything they need to sign, including the MuSig2 participant pubkeys, is carried
+in the PSBT, so they never import the multisig descriptor.
 """
 
 import random
@@ -46,10 +47,17 @@ class WalletTaprootDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
         """The multisig is created by importing a single multipath descriptor. The resulting wallet is watch-only and every signer can do this."""
         self.node.createwallet(wallet_name=f"{self.name}", blank=True, disable_private_keys=True)
         multisig = self.node.get_wallet_rpc(f"{self.name}")
-        # key path: a MuSig2 4-of-4 aggregate of all participants (the cheapest, most private spend)
-        # script path: `thresh(4,pk(key_1),pk(key_2),pk(key_3),pk(key_4),after(t1),after(t2),after(t3))`
+        # key path: a MuSig2 4-of-4 aggregate of all participants (the cheapest, most private spend).
+        # script path: one tap leaf per decay level, each a `multi_a` behind a halvening locktime (e.g.
+        # `and_v(v:after(t1),multi_a(3,key_1,...,key_4))`). Separate `multi_a` leaves keep `OP_IF` out of
+        # the tapscripts (unlike a single `thresh`).
         # IMPORTANT: when backing up your descriptor, the order of key_1...key_4 must be correct!
-        multisig_desc = f"tr(musig({','.join(xpubs)}),thresh({self.N},pk({'),s:pk('.join(xpubs)}),sln:after({'),sln:after('.join(map(str, self.locktimes))})))"
+        keys = ",".join(xpubs)
+        leaves = [f"and_v(v:after({t}),multi_a({self.N - 1 - i},{keys}))" for i, t in enumerate(self.locktimes)]
+        tree = leaves[-1]
+        for leaf in reversed(leaves[:-1]):
+            tree = f"{{{leaf},{tree}}}"
+        multisig_desc = f"tr(musig({keys}),{tree})"
         checksum = multisig.getdescriptorinfo(multisig_desc)["checksum"]
         result = multisig.importdescriptors([
             {  # Multipath descriptor expands to receive and change
@@ -65,8 +73,8 @@ class WalletTaprootDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
         """Spend the 4-of-4 via the MuSig2 key path: every participant first contributes a public
         nonce, then a partial signature once all nonces are known. The participant pubkeys travel in
         the PSBT, so the plain signer wallets take part without importing the multisig descriptor."""
-        # `finalize=False`: every signer can also satisfy the `thresh` script path, which would
-        # otherwise finalize the (larger) script path before the MuSig2 partial sigs are collected.
+        # Collect each participant's public nonce (round 1), then partial signature (round 2), with
+        # finalize=False, before the aggregate signature is assembled and the input is finalized below.
         psbt = self.node.combinepsbt([signer.walletprocesspsbt(psbt["psbt"], finalize=False)["psbt"] for signer in signers])
         assert_equal(len(self.node.decodepsbt(psbt)["inputs"][0]["musig2_pubnonces"]), self.N)
         psbt = self.node.combinepsbt([signer.walletprocesspsbt(psbt, finalize=False)["psbt"] for signer in signers])
@@ -113,8 +121,8 @@ class WalletTaprootDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
 
         self.log.info("Check that fewer than 4 signers cannot move the funds before the multisig decays...")
         # Both MuSig2 rounds with only 3 of the 4 signers: the key path cannot aggregate without all
-        # participants, and the script path needs 4 signatures until a locktime elapses, so neither
-        # path completes. This is the core "everyone must sign" guarantee before the wallet decays.
+        # participants, and no script-path leaf is spendable until a locktime elapses, so neither path
+        # completes. This is the core "everyone must sign" guarantee before the wallet decays.
         under_signed = multisig.walletcreatefundedpsbt(inputs=[], outputs={receiver.getnewaddress(): amount}, feeRate=0.00010, locktime=0)["psbt"]
         for _ in range(2):
             under_signed = self.node.combinepsbt([signers[m].walletprocesspsbt(under_signed, finalize=False)["psbt"] for m in range(self.N - 1)])
@@ -125,30 +133,28 @@ class WalletTaprootDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
             self.log.info(f"At block height >= {locktime} this multisig is {self.M}-of-{self.N}")
             current_height = self.node.getblock(self.node.getbestblockhash())['height']
 
-            # in this test each signer signs the same psbt "in series" one after the other.
-            # Another option is for each signer to sign the original psbt, and then combine
-            # and finalize these. In some cases this may be more optimal for coordination.
             psbt = multisig.walletcreatefundedpsbt(inputs=[], outputs={receiver.getnewaddress(): amount}, feeRate=0.00010, locktime=locktime)
-            # the random sample asserts that any of the signing keys can sign for the 3-of-4,
-            # 2-of-4, and 1-of-4. While this is basic behavior of the miniscript thresh primitive,
-            # it is a critical property of this wallet.
-            for i, m in enumerate(random.sample(range(self.M), self.M)):
-                psbt = signers[m].walletprocesspsbt(psbt["psbt"])
-                assert_equal(psbt["complete"], i == self.M - 1)
 
-            if self.M < self.N:
+            if self.M == self.N:
+                # No script-path leaf is spendable until a locktime elapses, so the 4-of-4 "everyone
+                # signs" case is spent through the cheaper, more private MuSig2 key path.
+                psbt = self._spend_keypath(signers, psbt)
+            else:
+                # in this test each signer signs the same psbt "in series" one after the other.
+                # Another option is for each signer to sign the original psbt, and then combine
+                # and finalize these. In some cases this may be more optimal for coordination.
+                # the random sample asserts that any of the signing keys can sign for the 3-of-4,
+                # 2-of-4, and 1-of-4 multi_a leaf, which is a critical property of this wallet.
+                for i, m in enumerate(random.sample(range(self.M), self.M)):
+                    psbt = signers[m].walletprocesspsbt(psbt["psbt"])
+                    assert_equal(psbt["complete"], i == self.M - 1)
+
                 self.log.info(f"Check that the time-locked transaction is too immature to spend with {self.M}-of-{self.N} at block height {current_height}...")
                 assert_equal(current_height >= locktime, False)
                 assert_raises_rpc_error(-26, "non-final", multisig.sendrawtransaction, psbt["hex"])
 
                 self.log.info(f"Generate blocks to reach the time-lock block height {locktime} and broadcast the transaction...")
                 self.generate(self.node, locktime - current_height)
-            else:
-                self.log.info("All the signers are required to spend before the first locktime, so spend the cheaper, more private MuSig2 key path instead of the script path signed above")
-                # The script path psbt above is already finalized, so fund a fresh one for the key-path
-                # nonce/partial-signature rounds (and broadcast that transaction below).
-                psbt = multisig.walletcreatefundedpsbt(inputs=[], outputs={receiver.getnewaddress(): amount}, feeRate=0.00010, locktime=locktime)
-                psbt = self._spend_keypath(signers, psbt)
 
             multisig.sendrawtransaction(psbt["hex"])
             sent += amount
